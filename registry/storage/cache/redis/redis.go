@@ -1,19 +1,17 @@
 package redis
 
 import (
-	"context"
 	"fmt"
-	"strconv"
 
-	"github.com/distribution/distribution/v3"
-	"github.com/distribution/distribution/v3/registry/storage/cache"
-	"github.com/distribution/distribution/v3/registry/storage/cache/metrics"
-	"github.com/distribution/reference"
-	"github.com/opencontainers/go-digest"
-	"github.com/redis/go-redis/v9"
+	"github.com/docker/distribution"
+	"github.com/docker/distribution/context"
+	"github.com/docker/distribution/digest"
+	"github.com/docker/distribution/reference"
+	"github.com/docker/distribution/registry/storage/cache"
+	"github.com/garyburd/redigo/redis"
 )
 
-// redisBlobDescriptorService provides an implementation of
+// redisBlobStatService provides an implementation of
 // BlobDescriptorCacheProvider based on redis. Blob descriptors are stored in
 // two parts. The first provide fast access to repository membership through a
 // redis set for each repo. The second is a redis hash keyed by the digest of
@@ -25,7 +23,7 @@ import (
 // Note that there is no implied relationship between these two caches. The
 // layer may exist in one, both or none and the code must be written this way.
 type redisBlobDescriptorService struct {
-	pool *redis.Client
+	pool *redis.Pool
 
 	// TODO(stevvooe): We use a pool because we don't have great control over
 	// the cache lifecycle to manage connections. A new connection if fetched
@@ -33,29 +31,17 @@ type redisBlobDescriptorService struct {
 	// request objects, we can change this to a connection.
 }
 
-var _ distribution.BlobDescriptorService = &redisBlobDescriptorService{}
-
 // NewRedisBlobDescriptorCacheProvider returns a new redis-based
 // BlobDescriptorCacheProvider using the provided redis connection pool.
-func NewRedisBlobDescriptorCacheProvider(pool *redis.Client) cache.BlobDescriptorCacheProvider {
-	return metrics.NewPrometheusCacheProvider(
-		&redisBlobDescriptorService{
-			pool: pool,
-		},
-		"cache_redis",
-		"Number of seconds taken by redis",
-	)
+func NewRedisBlobDescriptorCacheProvider(pool *redis.Pool) cache.BlobDescriptorCacheProvider {
+	return &redisBlobDescriptorService{
+		pool: pool,
+	}
 }
 
 // RepositoryScoped returns the scoped cache.
 func (rbds *redisBlobDescriptorService) RepositoryScoped(repo string) (distribution.BlobDescriptorService, error) {
-	if _, err := reference.ParseNormalizedNamed(repo); err != nil {
-		if err == reference.ErrNameTooLong {
-			return nil, distribution.ErrRepositoryNameInvalid{
-				Name:   repo,
-				Reason: reference.ErrNameTooLong,
-			}
-		}
+	if _, err := reference.ParseNamed(repo); err != nil {
 		return nil, err
 	}
 
@@ -71,7 +57,10 @@ func (rbds *redisBlobDescriptorService) Stat(ctx context.Context, dgst digest.Di
 		return distribution.Descriptor{}, err
 	}
 
-	return rbds.stat(ctx, dgst)
+	conn := rbds.pool.Get()
+	defer conn.Close()
+
+	return rbds.stat(ctx, conn, dgst)
 }
 
 func (rbds *redisBlobDescriptorService) Clear(ctx context.Context, dgst digest.Digest) error {
@@ -79,21 +68,26 @@ func (rbds *redisBlobDescriptorService) Clear(ctx context.Context, dgst digest.D
 		return err
 	}
 
+	conn := rbds.pool.Get()
+	defer conn.Close()
+
 	// Not atomic in redis <= 2.3
-	cmd := rbds.pool.HDel(ctx, rbds.blobDescriptorHashKey(dgst), "digest", "size", "mediatype")
-	res, err := cmd.Result()
+	reply, err := conn.Do("HDEL", rbds.blobDescriptorHashKey(dgst), "digest", "length", "mediatype")
 	if err != nil {
 		return err
 	}
-	if res == 0 {
+
+	if reply == 0 {
 		return distribution.ErrBlobUnknown
 	}
+
 	return nil
 }
 
-func (rbds *redisBlobDescriptorService) stat(ctx context.Context, dgst digest.Digest) (distribution.Descriptor, error) {
-	cmd := rbds.pool.HMGet(ctx, rbds.blobDescriptorHashKey(dgst), "digest", "size", "mediatype")
-	reply, err := cmd.Result()
+// stat provides an internal stat call that takes a connection parameter. This
+// allows some internal management of the connection scope.
+func (rbds *redisBlobDescriptorService) stat(ctx context.Context, conn redis.Conn, dgst digest.Digest) (distribution.Descriptor, error) {
+	reply, err := redis.Values(conn.Do("HMGET", rbds.blobDescriptorHashKey(dgst), "digest", "size", "mediatype"))
 	if err != nil {
 		return distribution.Descriptor{}, err
 	}
@@ -106,26 +100,10 @@ func (rbds *redisBlobDescriptorService) stat(ctx context.Context, dgst digest.Di
 	}
 
 	var desc distribution.Descriptor
-	digestString, ok := reply[0].(string)
-	if !ok {
-		return distribution.Descriptor{}, fmt.Errorf("digest is not a string")
-	}
-	desc.Digest = digest.Digest(digestString)
-	sizeString, ok := reply[1].(string)
-	if !ok {
-		return distribution.Descriptor{}, fmt.Errorf("size is not a string")
-	}
-	size, err := strconv.ParseInt(sizeString, 10, 64)
-	if err != nil {
+	if _, err := redis.Scan(reply, &desc.Digest, &desc.Size, &desc.MediaType); err != nil {
 		return distribution.Descriptor{}, err
 	}
-	desc.Size = size
-	if reply[2] != nil {
-		mediaType, ok := reply[2].(string)
-		if ok {
-			desc.MediaType = mediaType
-		}
-	}
+
 	return desc, nil
 }
 
@@ -141,19 +119,25 @@ func (rbds *redisBlobDescriptorService) SetDescriptor(ctx context.Context, dgst 
 		return err
 	}
 
-	return rbds.setDescriptor(ctx, dgst, desc)
+	conn := rbds.pool.Get()
+	defer conn.Close()
+
+	return rbds.setDescriptor(ctx, conn, dgst, desc)
 }
 
-func (rbds *redisBlobDescriptorService) setDescriptor(ctx context.Context, dgst digest.Digest, desc distribution.Descriptor) error {
-	cmd := rbds.pool.HMSet(ctx, rbds.blobDescriptorHashKey(dgst), "digest", desc.Digest.String(), "size", desc.Size)
-	if cmd.Err() != nil {
-		return cmd.Err()
+func (rbds *redisBlobDescriptorService) setDescriptor(ctx context.Context, conn redis.Conn, dgst digest.Digest, desc distribution.Descriptor) error {
+	if _, err := conn.Do("HMSET", rbds.blobDescriptorHashKey(dgst),
+		"digest", desc.Digest,
+		"size", desc.Size); err != nil {
+		return err
 	}
 
-	cmd = rbds.pool.HSetNX(ctx, rbds.blobDescriptorHashKey(dgst), "mediatype", desc.MediaType)
-	if cmd.Err() != nil {
-		return cmd.Err()
+	// Only set mediatype if not already set.
+	if _, err := conn.Do("HSETNX", rbds.blobDescriptorHashKey(dgst),
+		"mediatype", desc.MediaType); err != nil {
+		return err
 	}
+
 	return nil
 }
 
@@ -176,27 +160,27 @@ func (rsrbds *repositoryScopedRedisBlobDescriptorService) Stat(ctx context.Conte
 		return distribution.Descriptor{}, err
 	}
 
-	pool := rsrbds.upstream.pool
+	conn := rsrbds.upstream.pool.Get()
+	defer conn.Close()
+
 	// Check membership to repository first
-	member, err := pool.SIsMember(ctx, rsrbds.repositoryBlobSetKey(rsrbds.repo), dgst.String()).Result()
+	member, err := redis.Bool(conn.Do("SISMEMBER", rsrbds.repositoryBlobSetKey(rsrbds.repo), dgst))
 	if err != nil {
 		return distribution.Descriptor{}, err
 	}
+
 	if !member {
 		return distribution.Descriptor{}, distribution.ErrBlobUnknown
 	}
 
-	upstream, err := rsrbds.upstream.stat(ctx, dgst)
+	upstream, err := rsrbds.upstream.stat(ctx, conn, dgst)
 	if err != nil {
 		return distribution.Descriptor{}, err
 	}
 
 	// We allow a per repository mediatype, let's look it up here.
-	mediatype, err := pool.HGet(ctx, rsrbds.blobDescriptorHashKey(dgst), "mediatype").Result()
+	mediatype, err := redis.String(conn.Do("HGET", rsrbds.blobDescriptorHashKey(dgst), "mediatype"))
 	if err != nil {
-		if err == redis.Nil {
-			return distribution.Descriptor{}, distribution.ErrBlobUnknown
-		}
 		return distribution.Descriptor{}, err
 	}
 
@@ -213,11 +197,15 @@ func (rsrbds *repositoryScopedRedisBlobDescriptorService) Clear(ctx context.Cont
 		return err
 	}
 
+	conn := rsrbds.upstream.pool.Get()
+	defer conn.Close()
+
 	// Check membership to repository first
-	member, err := rsrbds.upstream.pool.SIsMember(ctx, rsrbds.repositoryBlobSetKey(rsrbds.repo), dgst.String()).Result()
+	member, err := redis.Bool(conn.Do("SISMEMBER", rsrbds.repositoryBlobSetKey(rsrbds.repo), dgst))
 	if err != nil {
 		return err
 	}
+
 	if !member {
 		return distribution.ErrBlobUnknown
 	}
@@ -236,34 +224,34 @@ func (rsrbds *repositoryScopedRedisBlobDescriptorService) SetDescriptor(ctx cont
 
 	if dgst != desc.Digest {
 		if dgst.Algorithm() == desc.Digest.Algorithm() {
-			return fmt.Errorf("redis cache: digest for descriptors differ but algorithm does not: %q != %q", dgst, desc.Digest)
+			return fmt.Errorf("redis cache: digest for descriptors differ but algorthim does not: %q != %q", dgst, desc.Digest)
 		}
 	}
 
-	return rsrbds.setDescriptor(ctx, dgst, desc)
+	conn := rsrbds.upstream.pool.Get()
+	defer conn.Close()
+
+	return rsrbds.setDescriptor(ctx, conn, dgst, desc)
 }
 
-func (rsrbds *repositoryScopedRedisBlobDescriptorService) setDescriptor(ctx context.Context, dgst digest.Digest, desc distribution.Descriptor) error {
-	conn := rsrbds.upstream.pool
-	_, err := conn.SAdd(ctx, rsrbds.repositoryBlobSetKey(rsrbds.repo), dgst.String()).Result()
-	if err != nil {
+func (rsrbds *repositoryScopedRedisBlobDescriptorService) setDescriptor(ctx context.Context, conn redis.Conn, dgst digest.Digest, desc distribution.Descriptor) error {
+	if _, err := conn.Do("SADD", rsrbds.repositoryBlobSetKey(rsrbds.repo), dgst); err != nil {
 		return err
 	}
 
-	if err := rsrbds.upstream.setDescriptor(ctx, dgst, desc); err != nil {
+	if err := rsrbds.upstream.setDescriptor(ctx, conn, dgst, desc); err != nil {
 		return err
 	}
 
 	// Override repository mediatype.
-	_, err = conn.HSet(ctx, rsrbds.blobDescriptorHashKey(dgst), "mediatype", desc.MediaType).Result()
-	if err != nil {
+	if _, err := conn.Do("HSET", rsrbds.blobDescriptorHashKey(dgst), "mediatype", desc.MediaType); err != nil {
 		return err
 	}
 
 	// Also set the values for the primary descriptor, if they differ by
-	// algorithm (ie sha256 vs sha512).
+	// algorithm (ie sha256 vs tarsum).
 	if desc.Digest != "" && dgst != desc.Digest && dgst.Algorithm() != desc.Digest.Algorithm() {
-		if err := rsrbds.setDescriptor(ctx, desc.Digest, desc); err != nil {
+		if err := rsrbds.setDescriptor(ctx, conn, desc.Digest, desc); err != nil {
 			return err
 		}
 	}
